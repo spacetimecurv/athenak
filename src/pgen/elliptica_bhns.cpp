@@ -3,8 +3,10 @@
 // Copyright(C) 2020 James M. Stone <jmstone@ias.edu> and the Athena code team
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
-//! \file elliptica_bns.cpp
-//  \brief Initial data reader for binary neutron star data with Elliptica
+//! \file elliptica_bhns.cpp
+//  \brief Initial data reader for black hole-neutron star data with Elliptica
+//  \brief Functionality is the same as elliptica_bns.cpp, but there are more 
+//  \brief details implemented here, i.e. BH/NS tracker, tabulated EOS, etc.
 
 #include <math.h>
 #include <stdio.h>
@@ -30,15 +32,15 @@
 #include "mhd/mhd.hpp"
 #include "parameter_input.hpp"
 
-void EllipticaBNSHistory(HistoryData *pdata, Mesh *pm);
-void EllipticaBNSRefinementCondition(MeshBlockPack *pmbp);
+void EllipticaBHNSHistory(HistoryData *pdata, Mesh *pm);
+void EllipticaBHNSRefinementCondition(MeshBlockPack *pmbp);
 
 //----------------------------------------------------------------------------------------
 //! \fn ProblemGenerator::UserProblem_()
-//! \brief Problem Generator for BNS with Elliptica
+//! \brief Problem Generator for BHNS with Elliptica
 void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
-  user_hist_func = &EllipticaBNSHistory;
-  user_ref_func = &EllipticaBNSRefinementCondition;
+  user_hist_func = &EllipticaBHNSHistory;
+  user_ref_func = &EllipticaBHNSRefinementCondition;
 
   if (restart) return;
 
@@ -55,7 +57,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   if (pmbp->pdyngr == nullptr || pmbp->pz4c == nullptr) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl
-              << "BNS data requires <mhd> and <z4c> blocks." << std::endl;
+              << "BHNS data requires <mhd> and <z4c> blocks." << std::endl;
     exit(EXIT_FAILURE);
   }
 
@@ -126,6 +128,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       }
     }
   }
+
 
   idr->set_param("ADM_B1I_form", "zero", idr);
 
@@ -225,13 +228,17 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
           host_adm.vK_dd(m, 1, 1, k, j, i) = idr->field[i_Kyy][idx];
           host_adm.vK_dd(m, 1, 2, k, j, i) = idr->field[i_Kyz][idx];
           host_adm.vK_dd(m, 2, 2, k, j, i) = idr->field[i_Kzz][idx];
-
+          
+          /* CHANGE HERE (START) - EOS QUANTITIES */
+          // TODO(OS): implement with EOS interface
           // Extract hydro quantities
           host_w0(m, IDN, k, j, i) = idr->field[i_rho][idx];
           host_w0(m, IPR, k, j, i) = idr->field[i_p][idx];
           Real vu[3]               = {
             idr->field[i_vx][idx], idr->field[i_vy][idx],
             idr->field[i_vz][idx]};
+
+          /* CHANGE HERE (END) - EOS QUANTITIES */
 
           // Before we store the velocity, we need to make sure it's physical
           // and calculate the Lorentz factor. If the velocity is superluminal,
@@ -259,19 +266,25 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     }
   }
 
-  std::cout << "Host mirrors filled." << std::endl;
+  if (global_variable::my_rank == 0) {
+    std::cout << "Host mirrors filled." << std::endl;
+  }
 
   // Cleanup
   elliptica_id_reader_free(idr);
 
-  std::cout << "Elliptica freed." << std::endl;
+  if (global_variable::my_rank == 0) {
+    std::cout << "Elliptica freed." << std::endl;
+  }
 
   // Copy the data to the GPU.
   Kokkos::deep_copy(u_adm, host_u_adm);
   Kokkos::deep_copy(w0, host_w0);
   Kokkos::deep_copy(u_z4c, host_u_z4c);
 
-  std::cout << "Data copied." << std::endl;
+  if (global_variable::my_rank == 0) {
+    std::cout << "Data copied." << std::endl;
+  }
 
   // TODO(JMF): Add magnetic fields
   auto &b0 = pmbp->pmhd->b0;
@@ -328,7 +341,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 }
 
 // History function
-void EllipticaBNSHistory(HistoryData *pdata, Mesh *pm) {
+void EllipticaBHNSHistory(HistoryData *pdata, Mesh *pm) {
   // Select the number of outputs and create labels for them.
   int &nmhd       = pm->pmb_pack->pmhd->nmhd;
   pdata->nhist    = 2;
@@ -340,48 +353,39 @@ void EllipticaBNSHistory(HistoryData *pdata, Mesh *pm) {
   auto &adm = pm->pmb_pack->padm->adm;
 
   // loop over all MeshBlocks in this pack
-  auto &indcs     = pm->pmb_pack->pmesh->mb_indcs;
-  int is          = indcs.is;
-  int nx1         = indcs.nx1;
-  int js          = indcs.js;
-  int nx2         = indcs.nx2;
-  int ks          = indcs.ks;
-  int nx3         = indcs.nx3;
+  auto &indcs = pm->pmb_pack->pmesh->mb_indcs;
+  int is = indcs.is; int nx1 = indcs.nx1;
+  int js = indcs.js; int nx2 = indcs.nx2;
+  int ks = indcs.ks; int nx3 = indcs.nx3;
   const int nmkji = (pm->pmb_pack->nmb_thispack) * nx3 * nx2 * nx1;
   const int nkji  = nx3 * nx2 * nx1;
   const int nji   = nx2 * nx1;
   Real rho_max    = std::numeric_limits<Real>::max();
   Real alpha_min  = -rho_max;
-  Kokkos::parallel_reduce(
-    "TOVHistSums", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
-    KOKKOS_LAMBDA(const int &idx, Real &mb_max, Real &mb_alp_min) {
-      // coompute n,k,j,i indices of thread
-      int m = (idx) / nkji;
-      int k = (idx - m * nkji) / nji;
-      int j = (idx - m * nkji - k * nji) / nx1;
-      int i = (idx - m * nkji - k * nji - j * nx1) + is;
-      k += ks;
-      j += js;
+  Kokkos::parallel_reduce("TOVHistSums", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
+  KOKKOS_LAMBDA(const int &idx, Real &mb_max, Real &mb_alp_min) {
+    // coompute n,k,j,i indices of thread
+    int m = (idx) / nkji;
+    int k = (idx - m * nkji) / nji;
+    int j = (idx - m * nkji - k * nji) / nx1;
+    int i = (idx - m * nkji - k * nji - j * nx1) + is;
+    k += ks;
+    j += js;
 
-      mb_max     = fmax(mb_max, w0_(m, IDN, k, j, i));
-      mb_alp_min = fmin(mb_alp_min, adm.alpha(m, k, j, i));
-    },
-    Kokkos::Max<Real>(rho_max), Kokkos::Min<Real>(alpha_min));
+    mb_max = fmax(mb_max, w0_(m, IDN, k, j, i));
+    mb_alp_min = fmin(mb_alp_min, adm.alpha(m, k, j, i));
+  }, Kokkos::Max<Real>(rho_max), Kokkos::Min<Real>(alpha_min));
 
   // Currently AthenaK only supports MPI_SUM operations between ranks, but we
   // need MPI_MAX and MPI_MIN operations instead. This is a cheap hack to make
   // it work as intended.
 #if MPI_PARALLEL_ENABLED
   if (global_variable::my_rank == 0) {
-    MPI_Reduce(
-      MPI_IN_PLACE, &rho_max, 1, MPI_ATHENA_REAL, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(
-      MPI_IN_PLACE, &alpha_min, 1, MPI_ATHENA_REAL, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(MPI_IN_PLACE, &rho_max, 1, MPI_ATHENA_REAL, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(MPI_IN_PLACE, &alpha_min, 1, MPI_ATHENA_REAL, MPI_MIN, 0, MPI_COMM_WORLD);
   } else {
-    MPI_Reduce(
-      &rho_max, &rho_max, 1, MPI_ATHENA_REAL, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Reduce(
-      &alpha_min, &alpha_min, 1, MPI_ATHENA_REAL, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&rho_max, &rho_max, 1, MPI_ATHENA_REAL, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&alpha_min, &alpha_min, 1, MPI_ATHENA_REAL, MPI_MAX, 0, MPI_COMM_WORLD);
     rho_max   = 0.;
     alpha_min = 0.;
   }
@@ -392,6 +396,6 @@ void EllipticaBNSHistory(HistoryData *pdata, Mesh *pm) {
   pdata->hdata[1] = alpha_min;
 }
 
-void EllipticaBNSRefinementCondition(MeshBlockPack *pmbp) {
+void EllipticaBHNSRefinementCondition(MeshBlockPack *pmbp) {
   pmbp->pz4c->pamr->Refine(pmbp);
 }

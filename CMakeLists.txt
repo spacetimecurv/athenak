@@ -198,6 +198,7 @@ if (${PROBLEM} STREQUAL "lorene_bns")
   find_package(BLAS REQUIRED)
   find_package(LAPACK REQUIRED)
   find_package(GSL REQUIRED)
+  #find_package(FFTW3 REQUIRED) did not work
   target_include_directories(athena PRIVATE
       ${CMAKE_SOURCE_DIR}/Lorene/Export/C++/Include
       ${CMAKE_SOURCE_DIR}/Lorene/C++/Include)
@@ -206,7 +207,7 @@ if (${PROBLEM} STREQUAL "lorene_bns")
       ${CMAKE_SOURCE_DIR}/Lorene/Lib/liblorene.a
       ${CMAKE_SOURCE_DIR}/Lorene/Lib/liblorenef77.a
       ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES}
-      GSL::gsl ${CMAKE_Fortran_IMPLICIT_LINK_LIBRARIES})
+      GSL::gsl fftw3 m ${CMAKE_Fortran_IMPLICIT_LINK_LIBRARIES}) # manually linked "fftw3 m" to make it work
 endif()
 
 # enable include of header files created in build directories
